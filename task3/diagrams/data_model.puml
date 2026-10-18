@@ -1,0 +1,358 @@
+@startuml data_model_unified
+skinparam defaultFontName DejaVu Sans
+skinparam defaultFontSize 14
+skinparam shadowing false
+skinparam linetype ortho
+skinparam nodesep 18
+skinparam ranksep 26
+hide circle
+hide methods
+skinparam entity {
+  BackgroundColor #FFFFFF
+  BorderColor #546E7A
+  HeaderBackgroundColor #ECEFF1
+  FontSize 13
+}
+skinparam class {
+  BackgroundColor #FFFFFF
+  BorderColor #546E7A
+  HeaderBackgroundColor #ECEFF1
+  FontSize 13
+}
+skinparam package {
+  BorderColor #455A64
+  BorderThickness 1.5
+  FontSize 14
+}
+skinparam note {
+  BackgroundColor #FFF8E1
+  BorderColor #F9A825
+  FontSize 11
+}
+
+title Единая модель данных AdScale TO-BE
+
+' ---------- 1. КАБИНЕТ ----------
+package "advertiserCache\nRedis (Primary/Replica)" #F4D6F4 {
+  class "campaigns" as AC1 <<кэш>> {
+    из Campaign DB
+  }
+  class "budgets" as AC2 <<кэш>> {
+    из Financial DB
+  }
+  class "aggregates" as AC3 <<кэш>> {
+    из ClickHouse Analytics
+  }
+  class "dashboard" as AC4 <<кэш>> {
+    стартовая страница
+  }
+  AC1 ..> AC4
+  AC2 ..> AC4
+  AC3 ..> AC4
+}
+
+' ---------- 2. КАМПАНИИ ----------
+package "Campaign DB\nPostgreSQL" #E8F1FF {
+  entity "adCampings\nкампании" as CD1 {
+    * campaign_id
+    --
+    * advertiser_id
+    статус
+    срок
+  }
+  entity "adContent\nконтент" as CD2 {
+    * content_id
+    --
+    * campaign_id
+    формат
+  }
+  entity "bidStrategy\nстратегия ставки" as CD3 {
+    * strategy_id
+    --
+    * campaign_id
+    базовая ставка
+    целевые данные
+    пользователя
+  }
+  entity "budget_rule\nправило бюджета" as CD4 {
+    * rule_id
+    --
+    * strategy_id
+    условие:
+    агрегат бюджета
+    ---
+    поправка ставки
+  }
+  entity "targeting_rule\nправило таргетинга" as CD5 {
+    * rule_id
+    --
+    * strategy_id
+    условие:
+    агрегат таргетинга
+    кампании
+    ---
+    поправка ставки
+  }
+  CD1 ||--o{ CD2
+  CD1 ||--o{ CD3
+  CD3 ||--o{ CD4
+  CD3 ||--o{ CD5
+}
+
+' ---------- 3. ФИНАНСЫ ----------
+package "Financial DB\nPostgreSQL (ACID)" #E8FFE8 {
+  entity "accounts\nсчета" as FD1 {
+    * advertiser_id
+    --
+    баланс
+  }
+  entity "budgets\nбюджеты" as FD2 {
+    * budget_id
+    --
+    * campaign_id
+    лимит
+    остаток
+  }
+  entity "statistic_budgets\nагрегаты бюджета" as FD5 {
+    * campaign_id
+    * период
+    --
+    расход
+  }
+  entity "reserve_budgets\nрезервы" as FD4 {
+    * reserve_id
+    --
+    * campaign_id
+    сумма
+  }
+  entity "state_budgets\nсостояние бюджета" as FD3 <<производная>> {
+    * campaign_id
+    --
+    бюджеты
+    − резервы
+    − расход
+  }
+  entity "credits\nпополнения" as FD6 {
+    * credit_id
+    --
+    * advertiser_id
+    статус
+  }
+  entity "debits\nсписания" as FD7 {
+    * debit_id
+    --
+    * advertiser_id
+    сумма
+  }
+  entity "transactions\nоперации" as FD8 {
+    * transaction_id
+    --
+    тип
+    идемп. ключ
+  }
+  FD2 --> FD3 : формирует
+  FD5 --> FD3 : формирует
+  FD4 --> FD3 : формирует
+  FD1 ||--o{ FD7 : только списания
+  FD6 --> FD8 : порождает
+  FD7 --> FD8 : порождает
+}
+
+' ---------- 4. ВЫДАЧА ----------
+package "Delivery DB\nPostgreSQL" #FFF4D6 {
+  entity "responses\nответы" as DD1 {
+    * request_id
+    --
+    auction_id
+    результат
+  }
+  entity "type_url\nтипы по URL" as DD3 {
+    * url
+    --
+    тип действия
+  }
+  entity "banners\nбаннеры" as DD2 {
+    * banner_id
+    --
+    * campaign_id
+    HTML/JS
+  }
+  DD3 ..> DD2 : используется
+  DD2 ..> DD1 : отдаётся в ответе
+  DD1 ..> DD3 : содержит
+}
+
+' ---------- 5. КЭШ СТАВОК ----------
+package "bidCache\nRedis (BC)" #D1C4E9 {
+  class "campaigns" as BC1 <<исходные>> {
+    из Campaign DB
+  }
+  class "strategy" as BC2 <<исходные>> {
+    из Campaign DB:
+    базовая ставка,
+    правила бюджета,
+    правила таргетинга,
+    поправки
+  }
+  class "content" as BC3 <<исходные>> {
+    из Campaign DB
+  }
+  class "banners" as BC4 <<исходные>> {
+    из Delivery DB
+  }
+  class "users_targeting" as BC5 <<исходные>> {
+    из ClickHouse Statistics
+  }
+  class "campaigns_targeting" as BC6 <<исходные>> {
+    из ClickHouse Statistics
+  }
+  class "state_budgets" as BC7 <<исходные>> {
+    из Financial DB
+  }
+  class "budgets" as BC8 <<производная>> {
+    из state_budgets
+  }
+  class "statistic_budgets" as BC10 <<производная>> {
+    из state_budgets
+  }
+  class "reserve_budgets" as BC9 <<производная>> {
+    из state_budgets
+  }
+  class "calculated_bids" as BC11 <<производная>> {
+    ставки
+  }
+  BC7 ..> BC8
+  BC7 ..> BC10
+  BC7 ..> BC9
+  BC1 ..> BC11
+  BC2 ..> BC11
+  BC7 ..> BC11
+  BC5 ..> BC11
+}
+
+' ---------- 6. АУКЦИОН ----------
+package "ClickHouse Auction\nOLAP" #FFE0B2 {
+  entity "candidates_data\nкандидаты" as AU2 {
+    * auction_id
+    --
+    * campaign_id
+    из bidCache
+    ---
+    ставка
+    из bidCache
+  }
+  entity "rules\nправила" as AU1 {
+    * rule_id
+    --
+    тип аукциона
+  }
+  entity "auction_result\nрезультаты" as AU3 {
+    * auction_id
+    --
+    winner
+    winner_bid
+  }
+  entity "ML_data" as AU4 {
+    * auction_id
+    --
+    признаки
+  }
+  AU2 --> AU3 : участвуют
+  AU1 --> AU3 : применяются
+  AU3 --> AU4 : поставляет данные
+}
+
+' ---------- 7. СТАТИСТИКА ----------
+package "ClickHouse Statistics\nOLAP" #FFCDD2 {
+  entity "action_EndUser\nдействия" as ST1 {
+    * action_id
+    --
+    * campaign_id
+    тип
+  }
+  entity "users_targeting\nпо пользователю" as ST2 {
+    * user_id
+    --
+    значение
+  }
+  entity "campaigns_targeting\nпо кампании" as ST3 {
+    * campaign_id
+    --
+    значение
+  }
+  ST1 --> ST2
+  ST1 --> ST3
+}
+
+' ---------- 8. АНАЛИТИКА ----------
+package "ClickHouse Analytics\nOLAP" #B3E5FC {
+  entity "events\nсобытия" as AN1 {
+    * event_id
+    --
+    тип
+    время
+  }
+  entity "aggregates\nпоказатели" as AN2 {
+    * campaign_id
+    * период
+    --
+    показы, клики
+  }
+  entity "reports\nотчёты" as AN3 {
+    * report_id
+    --
+    * advertiser_id
+    документ
+  }
+  AN1 --> AN2 : агрегация
+  AN1 --> AN3 : строятся из события
+}
+
+' ---------- ПРОЕКЦИИ МЕЖДУ ХРАНИЛИЩАМИ ----------
+CD1 ||..o{ FD2 : бюджет кампании
+CD1 ||..o{ BC1 : проекция
+CD2 ||..o{ BC3 : проекция
+CD3 ||..o{ BC2 : проекция
+CD4 ||..o{ BC2 : проекция
+CD5 ||..o{ BC2 : проекция
+DD2 ||..o{ BC4 : проекция
+FD3 ||..o{ BC7 : проекция
+BC1 ||..o{ AU2 : кампании
+BC11 ||..o{ AU2 : ставки
+ST2 ||..o{ BC5 : проекция
+ST3 ||..o{ BC6 : проекция
+CD1 ||..o{ AN1 : события
+DD1 ||..o{ AN1 : действия
+ST1 ||..o{ AN1 : агрегаты
+FD8 ||..o{ AN1 : операции
+CD1 ||..o{ AC1 : кампании
+FD2 ||..o{ AC2 : бюджеты
+AN2 ||..o{ AC3 : агрегаты
+
+' ---------- ВЫРАВНИВАНИЕ ----------
+AC1 -[hidden]down- CD1
+AC2 -[hidden]down- CD2
+AC3 -[hidden]down- CD3
+CD4 -[hidden]right- CD5
+DD3 -[hidden]right- DD2
+AU2 -[hidden]down- AU3
+AU1 -[hidden]right- AU2
+BC8 -[hidden]right- BC10
+BC10 -[hidden]right- BC9
+BC9 -[hidden]down- BC11
+ST1 -[hidden]down- ST2
+ST2 -[hidden]right- ST3
+AN1 -[hidden]down- AN2
+AN2 -[hidden]down- AN3
+
+legend right
+  **Как читать**
+  Рамка — хранилище одного сервиса.
+  **<<исходные>>** — копия из другого сервиса.
+  **<<производная>>** — вычислено внутри.
+  Сплошная линия — связь внутри хранилища.
+  Пунктир — проекция через Kafka.
+  Полные списки полей — в разделе 3 документа.
+endlegend
+
+@enduml
