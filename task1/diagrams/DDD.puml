@@ -1,0 +1,279 @@
+@startuml
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+
+LAYOUT_WITH_LEGEND()
+
+AddRelTag("auction", $lineColor="red", $textColor = "red" )
+AddRelTag("campaign", $lineColor="purple", $textColor = "purple" )
+AddRelTag("request", $lineColor="blue", $textColor = "blue" )
+AddRelTag("show", $lineColor="skyblue", $textColor = "skyblue" )
+AddRelTag("user", $lineColor="green", $textColor = "green" )
+AddRelTag("advertiser", $lineColor="orange", $textColor = "orange" )
+AddRelTag("finance", $lineColor="magenta", $textColor = "magenta" )
+AddRelTag("analytic", $lineColor="brown", $textColor = "brown" )
+AddRelTag("bid", $lineColor="black", $textColor = "black" )
+
+title Domain
+
+' ====================== Акторы ======================
+Person_Ext(endUser, "Пользователь сайта/приложения", "")
+
+System_Ext(dspPartner, "DSP-партнёр", "")
+System_Ext(platform, "Площадка (сайт/приложение)", "")
+System_Ext(paymentGateway, "Платёжный шлюз", "")
+
+Person(advertiser, "Рекламодатель", "")
+Person(userAdScale, "Сотрудник AdScale", "")
+Person(headAdScale, "Владелец продукта", "")
+
+' ====================== Монолит ======================
+Container_Ext(adSlot, "Рекламный слот", "", "")
+
+System_Boundary(adScale, "AdScale") {
+
+    System_Boundary(adCabinet, "Кабинет рекламодателя") {
+
+        Container(accountAdvertiser, "Учетные данные рекламодателя", "", "")
+        Boundary(campGroup, "Кампании") {
+            Container(adCamp, "Рекламная кампания", "", "")
+            Container(adContent, "Рекламный контент", "", "")
+            Container(ruleTargeting, "Правило таргетинга", "", "")
+            Container(ruleBudget, "Правило бюджета", "", "")
+            Container(strategyBid, "Стратегия ставки", "", "")
+            Container(multiplier, "Поправка", "", "")
+            Container(bid, "Ставка", "", "")
+        }
+        Boundary(budgetGroup, "Бюджет") {
+            Container(budget, "Бюджет", "", "")
+            Container(reserveBudget, "Резерв бюджета", "", "")
+            Container(statisticBudget, "Агрегаты бюджета", "", "")
+            Container(typeAggrBudget, "Типы агрегатов бюджета", "", "")
+            Container(credit, "Пополнение", "", "")
+        }
+
+        System_Boundary(financialService, "Сервис финансов") {
+            Container(debit, "Cписание", "", "")
+            Container(transaction, "Операция", "", "")
+            Container(Account, "Счет", "", "")
+       }
+
+       System_Boundary(analyticsService, "Сервис аналитики") {
+            Container(reports, "Отчеты", "", "")
+            Container(events, "События", "", "")
+            Container(aggregates, "Показатели", "", "")
+       }
+    }
+
+
+    Boundary(adService, "Реклама") {
+Container(accountPartner, "Учетные данные партнера", "", "")
+        System_Boundary(adServer, "Сервис запроса рекламы") {
+             Container(adRequest, "Запрос рекламы", "", "")
+
+             Container(candidate, "Кандидаты", "", "")
+             Container(limits, "Ограничения", "", "")
+             note bottom of limits
+             тип аукциона,
+             минимальная цена
+            end note
+             Container(typeUserData, "Типы данных пользователя", "", "")
+             Container(userData, "Данные пользователя", "", "")
+             note top of userData
+             гео,
+              устройство,
+              время,
+              сегмент,
+              сайт
+            end note
+            Container(adResponse, "Решение по запросу", "", "")
+
+        }
+        System_Boundary(auctionEngine, "Сервис аукциона") {
+                 Container(auction, "Аукцион", "", "")
+                 Container(rules, "Бизнес-правила", "", "")
+                 Container(winner, "Победитель", "", "")
+                 Container(winBid, "Победная ставка", "", "")
+
+            }
+
+        Boundary(run, "Исполнение") {
+            System_Boundary(deliveryService, "Сервис выдачи рекламы") {
+                 Container(ad, "Реклама", "", "")
+                 Container(partnerResponse, "Решение по использованию", "", "")
+            }
+
+            Container(contract, "Контракт", "", "")
+
+
+
+            System_Boundary(statsService, "Сервис статистики по действиям с рекламой") {
+                 Container(action, "Действия с рекламой", "", "")
+                 Container(typeAggrCampTargeting, "Типы агрегатов таргетинга по кампании", "", "")
+                 Container(statisticCampTargeting, "Агрегаты таргетинга по кампании", "", "")
+                 Container(typeAggrUserTargeting, "Типы агрегатов таргетинга по пользователю", "", "")
+                 Container(statisticUserTargeting, "Агрегаты таргетинга по пользователю", "", "")
+            }
+            }
+        }
+
+    }
+}
+
+' ====================== Связи ======================
+
+'' Внешние связи
+Rel_D(dspPartner, accountPartner, "Авторизуется", "HTTPS",  $tags="request")
+Rel_D(dspPartner, adRequest, "Запрашивает рекламу", "HTTPS / OpenRTB",  $tags="request")
+Rel_D(dspPartner, adResponse, "Получает", "HTTPS / OpenRTB",  $tags="request")
+Rel_D(dspPartner, adSlot, "Получает", "",  $tags="request")
+''
+Rel_R(platform, partnerResponse, "Возвращает", "HTTPS / OpenRTB",  $tags="show")
+Rel_D(platform, limits, "Задает", "",  $tags="show")
+Rel_R(platform, userData, "Собирает", "",  $tags="show")
+Rel_D(platform, ad, "Запрашивает", "HTTPS / OpenRTB",  $tags="show")
+Rel(platform, adSlot, "Предоставляет", "",  $tags="show")
+
+Rel_U(adSlot, limits, "содержит", "",  $tags="show")
+Rel_R(adSlot, userData, "содержит", "",  $tags="show")
+Rel_U(adSlot, adResponse, "предложение", "",  $tags="show")
+'
+Rel_U(endUser, adSlot, "Порождает", "",  $tags="user")
+Rel_U(endUser, userData, "обладает", "",  $tags="user")
+Rel_D(endUser, ad, "Смотрит, кликает", "HTTPS",  $tags="user")
+Rel_D(endUser, action, "совершает", "HTTPS",  $tags="user")
+Rel_D(endUser, statisticUserTargeting, "Имеет", "", $tags="user")
+'
+Rel_U(advertiser, accountAdvertiser, "Регистрируется/авторизуется", "HTTPS",  $tags="advertiser")
+Rel_U(advertiser, adContent, "Управляет", "HTTPS",  $tags="advertiser")
+Rel_U(advertiser, adCamp, "Управляет", "HTTPS",  $tags="advertiser")
+Rel_U(advertiser, strategyBid, "Управляет", "HTTPS",  $tags="advertiser")
+Rel_D(advertiser, ruleTargeting, "Управляет", "HTTPS",  $tags="advertiser")
+Rel_D(advertiser, ruleBudget, "Управляет", "HTTPS",  $tags="advertiser")
+Rel_D(advertiser, aggregates, "Просматривает", "HTTPS",  $tags="advertiser")
+Rel_D(advertiser, reports, "Запрашивает и просматривает", "HTTPS",  $tags="advertiser")
+Rel_D(advertiser, transaction, "Просматривает", "HTTPS",  $tags="advertiser")
+Rel_D(advertiser, Account, "Получает", "HTTPS",  $tags="advertiser")
+Rel_D(advertiser, credit, "Иницирует", "HTTPS",  $tags="advertiser")
+
+Rel(userAdScale, accountAdvertiser, "Администрирует", "")
+Rel(userAdScale, accountPartner, "Администрирует", "")
+Rel(userAdScale, adScale, "Отслеживает, поддерживает, разрабатывает, развертывает", "")
+
+Rel_D(headAdScale, rules, "Управляет", "")
+Rel(headAdScale, debit, "Получает", "")
+
+'Рекламная кампания
+Rel_D(adCamp, statisticCampTargeting, "Имеет", "", $tags="campaign")
+Rel_D(adCamp, statisticBudget, "Имеет", "", $tags="campaign")
+Rel_D(adCamp, budget,  "Владеет", "", $tags="campaign")
+Rel_U(adCamp, adContent,  "Содержит", "", $tags="campaign")
+Rel_U(adCamp, strategyBid,  "Содержит", "", $tags="campaign")
+Rel_D(strategyBid, ruleTargeting,  "Содержит", "", $tags="campaign")
+Rel_D(strategyBid, ruleBudget,  "Содержит", "", $tags="campaign")
+Rel_U(ruleBudget, multiplier,  "Определяет ", "", $tags="campaign")
+Rel_U(ruleTargeting, multiplier,  "Определяет ", "", $tags="campaign")
+Rel_D(ruleTargeting, typeAggrCampTargeting,  "Определено через ", "", $tags="campaign")
+Rel_D(ruleTargeting, statisticCampTargeting,  "Проверяет", "", $tags="campaign")
+Rel_D(ruleBudget, typeAggrBudget,  "Определено через ", "", $tags="campaign")
+Rel_D(ruleBudget, statisticBudget,  "Проверяет ", "", $tags="campaign")
+
+'запрос рекламы
+Rel_R(adRequest, limits, "Содержит", "",  $tags="request")
+Rel_D(adRequest, userData, "Содержит", "",  $tags="request")
+Rel_D(adRequest, auction, "Запускает", "", ,  $tags="request")
+Rel_L(adResponse, adRequest, "Обеспечивает", "",  $tags="request")
+Rel_R(adResponse, contract, "Содержит", "",  $tags="request")
+Rel_U(contract, winner, "Содержит", "",  $tags="request")
+Rel_U(contract, winBid, "Содержит", "",  $tags="request")
+Rel_D(contract, action, "Определяет ценность", "",  $tags="request")
+Rel(userData, statisticUserTargeting, "Идентифицируют", "", $tags="request")
+Rel_D(typeUserData, userData, "Типизируют", "", $tags="request")
+
+'расчет ставок
+Rel_L(candidate, userData, "Соотвествует", "", $tags="bid")
+Rel_U(candidate, adCamp,"Принадлежит", "", $tags="bid")
+Rel_U(adCamp,typeUserData, "Использует", "", $tags="bid")
+Rel_D(candidate, statisticUserTargeting, "Соотвествует", "", $tags="bid")
+
+Rel(candidate, bid, "Имеет", "", $tags="bid")
+Rel_D(strategyBid, bid,  "Определяет", "", $tags="bid")
+Rel_U(multiplier, bid,  "Изменяет", "", $tags="bid")
+Rel_D(bid, budget,  "Проверяет", "", $tags="bid")
+
+'аукцион
+Rel_D(limits, bid, "Ограничивают", "", $tags="auction")
+Rel_U(auction, limits,  "Соотвествует", "", $tags="auction")
+Rel_U(auction, bid,  "Использует", "", $tags="auction")
+Rel_U(auction, candidate,  "Использует", "", $tags="auction")
+Rel_D(auction, rules,  "Использует", "", $tags="auction")
+Rel_L(auction, winner,  "Определяет", "", $tags="auction")
+Rel_R(auction, winBid,  "Определяет", "", $tags="auction")
+Rel_D(auction, reserveBudget,  "Создает", "", $tags="auction")
+Rel_D(auction, contract,  "Формирует", "", $tags="auction")
+Rel_U(winner, candidate, "Принадлежит", ""  , $tags="auction")
+Rel_U(winBid, bid, "Принадлежит", "", $tags="auction")
+Rel_L(winBid, reserveBudget, "Определяет размер", "", $tags="auction")
+'
+'Реклама
+Rel_U(ad, adContent,  "Использует", "",  $tags="user")
+Rel(ad, action, "Фиксирует и типизирует", "",  $tags="user")
+Rel_U(ad, contract, "Реализует", "",  $tags="user")
+Rel(partnerResponse, action, "Фиксирует и типизирует", "",  $tags="show")
+Rel(partnerResponse, reserveBudget, "Изменяет", "",  $tags="show")
+Rel_U(action, contract, "Исполняет", "",  $tags="user")
+Rel(contract, debit, "запускает", "",  $tags="user")
+Rel_L(action, statisticUserTargeting, "формирует/изменяет", "",  $tags="user")
+Rel_D(action, statisticCampTargeting, "формирует/изменяет", "",  $tags="user")
+Rel_U(typeAggrUserTargeting, statisticUserTargeting, "Типизируют", "", $tags="user")
+Rel_U(typeAggrCampTargeting, statisticCampTargeting, "Типизируют", "", $tags="user")
+
+'Оплата показа
+Rel_U(budget, statisticBudget, "Имеет", "",  $tags="finance")
+Rel_D(typeAggrBudget,  statisticBudget,  "Типизируют", "",  $tags="finance")
+Rel_D(transaction, budget, "Изменяет", "",  $tags="finance")
+Rel_D(transaction, statisticBudget, "Изменяет", "",  $tags="finance")
+Rel_L(credit, budget, "Увеличивает", "",  $tags="finance")
+Rel_U(credit, transaction, "порождает", "",  $tags="finance")
+Rel_D(credit, paymentGateway, "Перечисление средств", "",  $tags="finance")
+Rel_D(debit, budget, "Расходует", "",  $tags="finance")
+Rel_U(debit, transaction, "порождает", "",  $tags="finance")
+Rel_U(debit, Account, "Порождает", "",  $tags="finance")
+Rel_D(reserveBudget, budget, "Сокращает", "", $tags="finance")
+
+'Аналитика
+Rel_D(events, statisticBudget, "Фиксирует изменения", "", $tags="analytic")
+Rel_D(events, statisticCampTargeting, "Фиксирует изменения", "", $tags="analytic")
+Rel_D(events, contract, "Фиксирует изменения", "", $tags="analytic")
+Rel_U(events, bid, "Фиксирует", "", $tags="analytic")
+Rel_U(events, adCamp, "Фиксируют изменения", "", $tags="analytic")
+Rel_D(events, transaction, "Фиксируют", "", $tags="analytic")
+Rel_L(reports, events, "Использует", "", $tags="analytic")
+Rel_U(events, aggregates, "Обновляют", "", $tags="analytic")
+
+Lay_L(dspPartner, platform)
+Lay_R(platform, endUser)
+Lay_U(adSlot, limits)
+Lay_D(adSlot, endUser)
+Lay_U(adSlot, platform)
+
+Lay_D(adCamp, ruleTargeting)
+Lay_D(adCamp, bid)
+Lay_D(bid, ruleTargeting)
+Lay_D(strategyBid, multiplier)
+Lay_D(ruleBudget, aggregates)
+Lay_D(ruleBudget, typeAggrBudget)
+Lay_D(events, transaction)
+Lay_D(limits, adCamp)
+Lay_D(limits, userData)
+Lay_D(candidate, auction)
+Lay_D(userData, winner)
+Lay_U(partnerResponse, winner)
+Lay_U(ad, partnerResponse)
+Lay_D(ad, action)
+Lay_D(ad, statisticUserTargeting)
+Lay_D(rules,contract)
+Lay_D(adRequest,typeUserData)
+
+
+@enduml
