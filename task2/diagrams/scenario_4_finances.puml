@@ -1,0 +1,121 @@
+@startuml
+title Сценарий 4: Финансы
+
+
+actor "Рекламодатель" as Advertiser
+participant "Платёжный\n шлюз" as PG
+
+participant "API\n Gateway" as GW
+
+box "Общее" #FFE8E8
+queue "RabbitMQ" as RQ
+queue "Kafka" as K
+end box
+
+participant "Istio\n Sidecar\n (Financial)" as FSISTIO
+box "Financial Service" #E8F1FF
+    participant "Transaction\n Worker" as TW
+    participant "Credit\n Worker" as CRW
+    database "Financial\n DB Primary" as FSDB
+    database "Financial\n DB Replica" as FSDBREP
+    participant "Financial\n BL" as FSBL
+    participant "Financial\n API" as FSAPI
+    participant "Contract\n Worker" as CW
+end box
+
+== Пополнение бюджета ==
+
+Advertiser -> GW++: [1.1] POST запрос пополнения
+    GW -> FSISTIO++: [4.F.1] HTTPS/REST over mTLS (Istio)
+        FSISTIO -> FSAPI++: [4.F.1.1] sidecar forwarding: входящий HTTP-запрос
+            FSAPI ->> RQ: [4.F.1.2] Queue Producer: credit
+        FSAPI --> FSISTIO--: Accepted
+    FSISTIO --> GW--: 202 Accepted
+GW --> Advertiser--: 202 Accepted
+
+RQ -> CRW++: [4.F.2] Queue Consumer: credit
+    CRW -> FSBL++: [4.F.2.1] Создание пополнения
+        FSBL -> FSDB++: [4.F.2.2] JDBC write: create credit
+        FSDB --> FSBL--: JDBC write: credit created
+    FSBL --> CRW--: ok
+    CRW ->> PG: [4.F.3] HTTPS/REST: платёжная транзакция
+    alt Timeout
+    CRW -> CRW: [4.F.3.1a] timeout
+    else
+    PG -> GW++: [4.F.3.1] HTTPS/REST: callback
+        GW -> FSISTIO++: [4.F.4] HTTPS/REST over mTLS
+            FSISTIO -> FSAPI++: [4.F.4.1] sidecar forwarding: входящий callback
+                FSAPI ->> RQ: [4.F.4.2] Queue Producer: credit(callback)
+                FSAPI --> FSISTIO--: Accepted
+            FSISTIO --> GW--: 202 Accepted
+    GW --> PG--: 202 Accepted
+RQ -> CRW: [4.F.5]Queue Consumer: credit(callback)
+    end
+alt Timeout или callback(Error)
+    CRW -> FSBL++: [4.F.5.a.1] удаление пополнения
+        FSBL -> FSDB++: [4.F.5.a.2]JDBC write: delete credit
+        FSDB --> FSBL--: JDBC write: credit deleted
+    FSBL --> CRW--: ok
+alt После 3 retries
+CRW ->> RQ: credit(NACK + DLQ)
+else
+CRW ->> RQ: credit(NACK + requeue с backoff)
+end
+else callback: OK
+    CRW -> FSBL++: [4.F.5.1] обновление пополнения
+        FSBL -> FSDB++: [4.F.5.2] JDBC write: update credit
+        FSDB --> FSBL--: JDBC write: credit updated
+    FSBL --> CRW--: ok
+    CRW ->> RQ: [4.F.5.3] Queue Producer: transaction
+CRW -> RQ--: credit(ACK)
+end
+
+== Идемпотентная транзакция ==
+
+RQ -> TW++:[4.F.6] Queue Consumer: transaction
+    TW -> FSBL++:[4.F.6.1] идемпотентная транзакция
+        FSBL -> FSDB++:[4.F.6.2] create transaction
+        FSDB --> FSBL--: transaction created
+        FSBL -> FSDB++:[4.F.6.2.1] update budget
+        FSDB --> FSBL--: budget updated
+        alt если transaction.type = debit
+            FSBL -> FSDB++: [4.F.6.2.2] update account
+            FSDB --> FSBL--: account updated
+        end
+alt ошибка
+        FSBL -> FSBL: saga
+    FSBL --> TW: ERROR
+alt После 3 retries
+TW -> RQ: transaction (NACK + DLQ)
+else
+TW -> RQ: transaction (NACK + requeue с backoff)
+end
+else успех
+        FSBL -> FSDB++:[4.F.6.2.3] update statistic_budget
+        FSDB --> FSBL--: statistic_budget updated
+        FSBL ->> K:[4.F.6.3] Kafka producer: Событие изменения бюджета (state_budget_changed)
+        note right of K: см. Сценарий 5. Обновление кешей
+    FSBL --> TW--: OK
+TW -> RQ: transaction (ACK)
+end
+
+== Просмотр финансов ==
+
+FSDB ->> FSDBREP: [4.F.6.2.1]/[4.F.2.2.1] streaming: репликация
+Advertiser -> GW++:[1.1] GET budgets / state_budgets / transactions / accounts
+    GW -> FSISTIO++:[4.F.1] HTTPS/REST over mTLS (Istio)
+        FSISTIO -> FSAPI++:[4.F.1.1] sidecar forwarding: входящий HTTP-запрос
+            FSAPI -> FSDBREP++: [4.F.2(a)] JDBC read
+            FSDBREP --> FSAPI--: budgets / statisic_budgets / reserve_budgets / transactions/ accounts
+            FSAPI -> FSAPI: [4.F.2(a).1] формирование производных (budgets / statisic_budgets / reserve_budgets -> state_budgets)
+        FSAPI --> FSISTIO--: response: budgets / state_budgets / transactions / accounts
+    FSISTIO --> GW--: response
+GW --> Advertiser--: HTTPS: response
+
+== Контракты ==
+
+K -> CW++: [3.F.1] Kafka Consumer: события контрактов (contract_create / contract_activate / contract_deactivate / contract_completed)
+    note left of CW: см. Сценарий 3. Действия с рекламой. Контракты
+CW --> K:
+
+@enduml

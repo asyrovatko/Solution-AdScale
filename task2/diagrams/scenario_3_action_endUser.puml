@@ -1,0 +1,129 @@
+@startuml
+title Сценарий 3: Действия с рекламой
+
+
+actor "Площадка" as Platform
+actor "Пользователь" as User
+
+participant "API\n Gateway" as GW
+
+box "Общее" #FFE8E8
+queue "Kafka" as K
+queue "RabbitMQ" as RQ
+end box
+
+participant "Istio Sidecar\n (Delivery)" as DELISTIO
+box "Delivery Service" #E8FFE8
+database "Delivery\n DB Replica" as DDBREP
+database "Delivery\n DB Primary" as DDB
+participant "Delivery\n API" as DA
+end box
+
+participant "Istio Sidecar\n (Stats)" as STATISTIO
+box "Statistic Service"  #FFF4D6
+participant "Action\n Worker" as SW
+database "Statistic\n Clickhouse\n Primary" as SSDB
+database "Statistic\n Clickhouse\n Replica" as SSDBREP
+participant "Stats\n BL" as SSBL
+participant "Stats\n API" as SS
+end box
+
+box "Financial Service" #E8F1FF
+participant "Contract\n Worker" as CW
+database "Financial\n DB Primary" as FSDB
+database "Financial\n DB Replica" as FSDBREP
+participant "Financial\n BL" as FSBL
+participant "Financial\n API" as FSA
+end box
+
+== Действие пользователя/площадки ==
+alt действие вне рекламы
+Platform -> GW++: [3.1] HTTPS: проигрыш/выигрыш/показ
+else действие внутри рекламы
+User -> GW: [3.1(a)] HTTPS: клик
+end
+     GW -> DELISTIO++: [3.D.1] HTTPS/REST over mTLS (Istio): действие с рекламой
+        DELISTIO -> DA++: [3.D.1.1] sidecar forwarding: входящий HTTP-трафик
+            DA -> DDB++: [3.D.2] JDBC read: поиск дубля
+            DDB --> DA--: JDBC read: дубли
+            DA -> DA: [3.D.2.1] Дедубликация запросов
+            alt Дублей нет
+            DA -> DDB++: [3.D.3] JDBC write: сохранение запроса
+            DDB --> DA--: JDBC write: запрос сохранен
+            DDB ->> DDBREP: [3.D.3.1] streaming: репликация
+            alt проигрыш
+               DA ->> K: [3.D.4(a)] Kafka Producer: действие пользователя (contract_deactivated)
+               note right of K: см. Контракты
+            else Выигрыш
+               DA ->> K: [3.D.4(b)] Kafka Producer: действие пользователя (contract_activated)
+               note right of K: см. Контракты
+            else показ
+               DA -> DDBREP++: [3.D.2.2] Получить тип действия по url
+               DDBREP -> DA--: тип действия
+               DA ->> K: [3.D.4] Kafka Producer: действие пользователя (action_endUser)
+               note right of K: см. Сохранение статистики и обновление таргетинга
+            end
+            end
+alt если нужно вернуть баннер
+            DA -> DDBREP++: [3.D.2.3] Получить сформированный\n во время запроса рекламы баннер
+            DDBREP -> DA--: banner
+        DA --> DELISTIO: banner
+    DELISTIO --> GW: response
+GW --> Platform: HTTPS: ad displayed
+else
+        DA --> DELISTIO--: ok
+    DELISTIO --> GW--: ok
+GW --> Platform--: ok
+end
+
+== Сохранение статистики и обновление таргетинга ==
+K -> SW++: [3.S.1] Kafka Consumer: условие контракта по действиям (contract_action_task)
+K -> SW++: [3.S.1.1] Kafka Consumer: действие пользователя (action_endUser)
+    SW -> SSBL++: [3.S.2] Internal Call: обработка батча действий
+        SSBL ->> SSDB: [3.S.3] JDBC write: батчевая запись действий\nи производного таргетинга\n(action_EndUser, users_targeting, campaigns_targeting)
+        note left of SSBL: батчевое накопление (окно) — не на каждое действие
+        SSDB ->> SSDBREP: [3.S.3.1] streaming: репликация
+        SSBL ->> K: [3.S.4] Kafka Producer: события об изменении таргетинга (targeting_changed)
+        note right of K: см. Сценарий 5. Обновление кешей
+    SSBL --> SW--: OK
+
+SW -> K--: ACK
+alt если условие контракта выполнено после сохранения батча
+    SW ->> K: [3.S.4.1] Kafka Producer: события о выполнении условия договора (contract_completed)
+    note right of K: см. Контракты
+end
+SW -> K--: ACK
+
+== Контракты ==
+
+K -> CW++: [3.F.1] Kafka Consumer: события контрактов (contract_created, contract_activated, contract_deactivated, contract_completed)
+    CW -> FSBL: [3.F.2] действие с контрактом
+    alt contract_create
+        FSBL -> FSDB++: [3.F.3(a).1] JDBC write: create contract
+        FSDB --> FSBL--: JDBC write: contract created
+        FSBL -> FSDB++: [3.F.3(a).2] JDBC write: create reserve_budget
+        FSDB --> FSBL--: JDBC write: reserve_budget created
+    else другие события
+        FSBL -> FSDB++: [3.F.3.1] JDBC write: update contract
+        FSDB --> FSBL--: JDBC write: contract updated
+
+        alt contract_activate
+        FSBL ->> K: [3.F.4] Kafka Producer: событие о ожидаемых действиях для выполнения контракта (contract_action_task)
+        note right of K: см. Сохранение статистики и обновление таргетинга
+        else другие события
+        FSBL -> FSDB++: [3.F.3.2] JDBC write:  delete reserve_budget
+        FSDB --> FSBL--: JDBC write: reserve_budget deleted
+        alt contract_completed
+        FSBL -> FSDB++: [3.F.3.3] JDBC write: create debit
+        FSDB --> FSBL--: JDBC write: debit created
+        FSBL ->> RQ: [3.F.4(a)] Queue Producer: transaction (type = debit)
+        note right of RQ: см. Сценарий 4. Финансы
+        end
+        end
+    end
+    FSDB ->> FSDBREP: [3.F.3.4]/[3.F.3(a).3] streaming: репликация
+    FSBL --> CW--: OK
+CW -> K--: ACK
+
+
+@enduml

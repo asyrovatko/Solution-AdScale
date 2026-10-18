@@ -1,0 +1,110 @@
+@startuml
+title Сценарий 2: Запрос партнёра (hot path)
+
+
+participant "DSP-Partner" as Partner
+
+
+participant "API\n Gateway" as GW
+box "Общее" #FFE8E8
+    queue "Kafka" as K
+end box
+
+participant "Istio Sidecar\n (Ad)" as ADISTIO
+box "Bidding Service" #E8F1FF
+    participant "Ad\n Server" as ASRV
+    database "Redis\n Bidding\n Primary" as RC
+    database "Redis\n Bidding\n Replica" as RCR
+    participant "Ad\n API" as RS
+end box
+
+participant "Istio Sidecar\n (Auction)" as AUCISTIO
+box "Auction Service" #E8FFE8
+    database "Clickhouse\n Auction Primary" as AC
+    database "Clickhouse\n Auction Replica" as ACR
+    participant "Auction\n Engine" as AE
+    participant "Auction\n API" as AA
+end box
+
+note over Partner, K: Бюджет: меньше 80 ms p99 на всю операцию
+
+Partner -> GW++: [2.1] HTTPS/OpenRTB: bid request
+    GW -> ADISTIO++: [2.R.1] HTTPS/OpenRTB over mTLS (Istio): проверка\n(rate limiting per DSP, Auth, circuit breaker)
+        ADISTIO -> RS++: [2.R.1.1] sidecar forwarding: входящий HTTP-трафик
+            note left of RC
+                Redis Cluster (bidCache):
+                - campaigns
+                - strategy (budget_rules, targeting_rules, multipliers)
+                - content
+                - banners
+                - users_targeting
+                - campaigns_targeting
+                - state_budgets
+                - budgets
+                - reserve_budgets
+                - statistic_budgets
+                - calculated_bids
+            end note
+            RS -> ASRV++: Internal Call: [2.R.2] запуск отбора кандидатов (campaigns, users_targeting, bid_request.limits)
+            ASRV -> RCR++: Internal Call: [2.R.2.1] получение кэшированных данных кампаний и таргетинга пользователя
+            RCR --> ASRV--: campaigns, users_targeting[bid_request.userData]
+            alt если в кеше есть кампании
+                ASRV -> ASRV : [2.R.2.1.1] отбор кандидатов (candidates_list)
+                alt Если в ответе сразу требуется баннер
+                ASRV -> RCR++: [2.R.2.2] Internal Call: получение кешированных баннеров отобранных кампаний
+                RCR --> ASRV--: banner_list
+                ASRV -> ASRV : [2.R.2.2.1] отсев кандидатов по наличию баннера (candidates_list)
+                end
+                alt candidates_list пуст
+                ASRV --> RS : no-candidates
+                else
+                ASRV --> RS : candidates_list
+                end
+            else если в кеше нет кампаний
+                ASRV --> RS : cache_empty
+                RS ->> K:[2.R.2.3(a)] Kafka Producer: инициализация кеша (bid_cache_init)
+                note right of K: см. Сценарий 5. Обновление кешей
+            end
+alt no-candidates или cache_empty
+        RS --> ADISTIO: bid response: no-bid
+    ADISTIO --> GW: bid response: no-bid
+GW --> Partner: HTTPS/OpenRTB: bid response: no-bid
+else В кеше есть кампании и сервис ставок доступен
+
+       ASRV -> RCR++:[2.R.2.3] Internal Call: получение кешированных стратегий,\n таргетинга кампании и состояния бюджета
+       RCR --> ASRV--: (startegy, campaigns_targeting, state_budget, calculated_bids)
+       ASRV -> ASRV:[2.R.2.3.1] применить поправки по ограничениям аукциона и\n состоянию бюджета c учетом резервов (candidates_bids)
+       alt Требуется проведение собственного аукциона и доступен сервис аукциона
+       group timeout 10ms, retry 1x, CB 50%/30s
+       ASRV -> AUCISTIO++: [2.R.3] gRPC over mTLS (Istio): Запуск аукциона (candidates list, candidates_bids)
+
+            AUCISTIO -> AA++: [2.AU.1] sidecar forwarding: входящий gRPC-трафик (auction request)
+            AA -> ACR++: [2.AU.2] получение бизнес правил и истории аукционов
+            ACR --> AA--: Данные необходимые для расчета
+            AA -> AE++: [2.AU.2.1] Internal Call: расчёт победителя
+                note right of AE: candidate list, calculated_bids,\nrules -> winner, winner_bid
+            AE --> AA--:  winner, winner_bid
+            AA -> AC++: [2.AU.3] Сохранение истории аукциона и результатов
+            AC --> AA--: Данные необходимые для расчета
+            AC ->> ACR--: [2.AU.3.1] streaming: репликация
+            AA --> AUCISTIO--: winner, winner_bid
+
+       AUCISTIO --> ASRV--: (winner, winner_bid)
+       end
+       ASRV -> RC++: [2.R.4] создать резерв бюджета победителя
+       RC -> ASRV--: резерв создан (state_budget changed)
+       else
+       ASRV -> RC++: [2.R.4]создать резерв бюджета кандидата
+       RC -> ASRV--: резерв создан (state_budget changed)
+       end
+       RC ->> RCR: [5.1.4.1]/[2.R.4.1] streaming: репликация
+       ASRV -> ASRV: [2.R.4.5] сформировать контракты по типу аукциона (contract list)
+       ASRV --> RS--: формирование bid response (contract list, banner list)
+       RS --> ADISTIO: bid response
+    ADISTIO --> GW--: bid response
+GW --> Partner--: HTTPS/OpenRTB: bid response
+       RS ->> K--: [2.R.5.1] Kafka Producer: событие создания контракта (contract_create)
+       note right of K: см. Сценарий 3. Действия с рекламой. Контракты
+end
+
+@enduml

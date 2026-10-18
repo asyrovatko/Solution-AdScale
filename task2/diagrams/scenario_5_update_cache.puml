@@ -1,0 +1,129 @@
+@startuml
+title Сценарий 5: Асинхронное обновление кэшей и пересчёт ставок
+
+
+queue "Kafka" as K
+
+box "Общее" #FFE8E8
+    queue "Kafka" as K
+end box
+
+box "Bidding Service" #E8F1FF
+    participant "Update\n Cache\n Worker" as CU
+    participant "Ad\n Server" as ASRV
+    participant "Ad\n API" as RS
+    database "Redis\n Bidding" as RC
+
+end box
+
+box "Advertiser BFF" #F4D6F4
+    participant "Advertiser\n BFF" as BFF
+    participant "Advertiser\n Cache\n Replica" as BFFCREP
+    participant "Advertiser\n Cache\n Primary" as BFFC
+end box
+
+participant "Istio Sidecar\n (Campaign)" as CSISTIO
+participant "Istio Sidecar\n (Financial)" as FSISTIO
+participant "Istio\n Sidecar\n (Analytics)" as AAISTIO
+
+participant "Istio Sidecar\n (Stats)" as STATISTIO
+box "Statistic Service"  #FFF4D6
+    database "Statistic\n Clickhouse\n Replica" as SSDBREP
+    database "Statistic\n Clickhouse\n Primary" as SSDB
+    participant "Stats\n BL" as SSBL
+    participant "Stats\n API" as SS
+end box
+
+participant "Istio Sidecar\n (Delivery)" as DELISTIO
+box "Delivery Service" #E8FFE8
+    database "Delivery\n DB Replica" as DDBREP
+    database "Delivery\n DB Primary" as DDB
+    participant "Delivery\n API" as DA
+end box
+
+== Обновление кэша ставок ==
+K -> CU++: [5.1] Kafka Consumer: события\n(bid_cache_init / campaign_changed / content_changed / strategy_changed /\n state_budget_changed / targeting_changed )
+    note right of RC
+      Redis Cluster (bidCache):
+        - campaigns
+        - strategy (budget_rules, targeting_rules, multipliers)
+        - content
+        - banners
+        - users_targeting
+        - campaigns_targeting
+        - state_budgets
+        - budgets (производная)
+        - reserve_budgets (производная)
+        - statistic_budgets (производная)
+        - calculated_bids (производная)
+    end note
+    alt bid_cache_init, campaign_changed или content_changed или strategy_changed
+        CU -> CSISTIO++: [5.1.1] gRPC over mTLS (Istio): запрос кампании, стратегии, контента рекламы
+        note left of CSISTIO: см. сценарий 1. Кабинет рекламодателя. Управление кампаниями
+        CSISTIO --> CU--: campaigns, strategy, content
+        alt adContent_changed
+            CU -> DELISTIO++: [5.1.1.1]  gRPC over mTLS (Istio): запрос баннера
+                DELISTIO -> DA++: [5.D.1] sidecar forwarding: входящий gRPC-трафик
+                    DA -> DDBREP++: [5.D.2] получение URL для ссылок в рекламе
+                    DDBREP --> DA--: URL
+                    DA -> DA : [5.D.2.1] формирование готовой рекламы
+                    DA -> DDB++: [5.D.3] create banner
+                    DDB --> DA--: banner
+                    DDB ->> DDBREP: [5.D.3.1] streaming: репликация
+                DA --> DELISTIO--: banner
+            DELISTIO --> CU--: banner
+        end
+    else  bid_cache_init, targeting_changed
+        CU -> STATISTIO++: [5.1.2] gRPC over mTLS (Istio): запрос таргетинга пользователя или кампании
+            STATISTIO -> SS++: [5.S.1] sidecar forwarding: входящий gRPC-трафик\n(campaigns_targeting / user_targeting request)
+                SS -> SSDBREP++: [5.S.2] read: действия пользователя и таргетинг по запросу
+                SSDBREP --> SS--: users_targeting, campaigns_targeting
+            SS --> STATISTIO--: targeting data
+        STATISTIO --> CU--: users_targeting
+    else bid_cache_init, state_budget_changed
+        CU -> FSISTIO++: [5.1.3] gRPC over mTLS (Istio): запрос состояния бюджета
+        note left of FSISTIO: см. сценарий 1. Кабинет рекламодателя. Просмотр финансов
+        FSISTIO --> CU--: state_budget
+    end
+    CU -> RC++: [5.1.4] Internal Call: запись в кэш исходных данных
+    RC --> CU--: saved
+    CU -> CU: [5.1.4.1] вычисление производных
+    CU -> RC++: [5.1.5] Internal Call: запись в кэш производных
+    RC --> CU--: saved
+
+CU -> K--: ACK
+
+== Обновление кэша рекламодателя ==
+
+K -> BFF++: [5.2] Kafka Consumer: события\n( campaign_changed / state_budget_changed / analytics_changed)
+
+    note right of BFFC
+      Redis Cluster (bffCache):
+        - campaigns
+        - budgets
+        - aggregates
+        - dashboard
+    end note
+    alt campaign_changed
+        BFF -> CSISTIO++: [5.2.1] HTTPS/REST over mTLS over mTLS (Istio): запрос кампаний
+        note left of CSISTIO: см. сценарий 1. Кабинет рекламодателя. Управление кампаниями
+        CSISTIO --> BFF--: campaigns
+    else state_budget_changed
+        BFF -> FSISTIO++: [5.2.2] HTTPS/REST over mTLS (Istio): запрос бюджета
+        note left of FSISTIO: см. сценарий 1. Кабинет рекламодателя. Просмотр финансов
+        FSISTIO --> BFF--: budget
+    else analytics_changed
+        BFF -> AAISTIO++: [5.2.3] HTTPS/REST over mTLS over mTLS (Istio): запрос агрегатов
+        note left of AAISTIO: см. сценарий 1. Кабинет рекламодателя. Просмотр аналитики
+        AAISTIO --> BFF--: aggregates
+    end
+    BFF -> BFFC++: [5.2.4] Internal Call: запись в кэш исходных данных
+    BFFC --> BFF--: saved
+    BFF -> BFF: [5.2.4.1] вычисление dashboard
+    BFF -> BFFC++: [5.2.4.2] Internal Call: запись в кэш dashboard
+    BFFC --> BFF--: saved
+    BFFC ->> BFFCREP--: [5.2.4.3] streaming: репликация
+
+BFF -> K--: ACK
+
+@enduml
