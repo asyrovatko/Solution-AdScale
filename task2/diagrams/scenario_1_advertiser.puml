@@ -1,0 +1,159 @@
+@startuml
+title Сценарий 1: Кабинет рекламодателя
+
+
+actor "Рекламодатель" as Advertiser
+
+participant "API\n Gateway" as GW
+participant "Istio\n Sidecar\n (BFF)" as BFFISTIO
+box "Advertiser BFF" #F4D6F4
+    participant "Advertiser\n Cache\n Replica" as BFFCREP
+    participant "Advertiser\n Cache\n Primary" as BFFC
+    participant "Advertiser\n BFF" as BFF
+end box
+
+box "События" #FFE8E8
+    queue "Kafka" as K
+    queue "RabbitMQ" as RQ
+end box
+participant "Istio\n Sidecar\n (Financial)" as FSISTIO
+
+participant "Istio\n Sidecar\n (Campaign)" as CSISTIO
+box "Campaign Service" #E8F1FF
+    participant "Campaign\n BL" as CSBL
+    database "Campaign\n DB Replica" as CSDBREP
+    database "Campaign\n DB Primary" as CSDB
+    participant "Campaign\n API" as CSAPI
+end box
+
+participant "Istio\n Sidecar\n (Analytics)" as AAISTIO
+box "Analytics Service" #FFF4D6
+    participant "Analytics\n Worker\n Cluster" as AW
+    participant "Reports\n Worker\n Cluster" as RW
+    database "ClickHouse\n Replica" as CHREP
+    database "ClickHouse\n Primary" as CH
+    participant "Analytics\n API" as AAAPI
+end box
+
+
+
+
+== Просмотр кабинета ==
+
+Advertiser -> GW++: [1.1] HTTPS: запрос открытия кабинета
+    GW -> BFFISTIO++: [1.2] HTTPS over mTLS (Istio)
+       BFFISTIO -> BFF++: [1.3] HTTPS: запрос стартовой страницы
+            BFF -> BFFCREP++: [1.4] Internal Call:\n получить закэшированные данные рекламодателя
+            BFFCREP --> BFF--: dashboard (профиль, баланс, список кампаний, агрегаты)
+
+            alt Если данные устарели/отсуствуют, то параллельные запросы BFF к сервисам в этими данными
+                par timeout 2s, retry 2x, CB 50%/30s
+                    BFF -> CSISTIO++: [1.4.1] HTTPS/REST over mTLS (Istio): GET campaign
+                        note right of CSISTIO: cм. Управление кампаниями
+                    CSISTIO --> BFF--: сampaigns
+                else timeout 2s, retry 2x, CB 50%/30s
+                    BFF -> AAISTIO++: [1.4.2] HTTPS/REST over mTLS (Istio): GET aggregates
+                        note right of AAISTIO: cм. Просмотр аналитики
+                    AAISTIO --> BFF--: aggregates
+                else timeout 2s, retry 2x, CB 50%/30s
+                    BFF -> FSISTIO++: [1.4.3] HTTPS/REST over mTLS (Istio): GET budgets
+                        note left of FSISTIO: cм. Просмотр финансов
+                    FSISTIO --> BFF--: budgets
+                end
+                BFF -> BFFC++: [1.4.4.1] Internal Call:\n запись в кэш исходных данных
+                BFFC --> BFF--: saved
+                BFF -> BFF: [1.4.4.2] вычисление dashboard
+                BFF -> BFFC++: [1.4.4.3] Internal Call:\n запись в кэш dashboard
+                BFFC --> BFF--: saved
+                BFFC ->> BFFCREP--: [1.4.5] streaming: репликация
+            end
+        BFF --> BFFISTIO--: dashboard
+    BFFISTIO --> GW--: dashboard
+GW --> Advertiser--: HTTPS: dashboard
+
+== Управление кампаниями ==
+
+Advertiser -> GW++: [1.1] POST/PATCH/DELETE/GET кампания/контент/стратегия
+    GW -> CSISTIO++: [1.C.1] HTTPS/REST over mTLS (Istio)
+        CSISTIO -> CSAPI++: [1.C.2] sidecar forwarding: входящий HTTP-запрос
+            alt POST/PATCH/DELETE
+            CSAPI -> CSBL++: [1.C.3] Internal Call: обработка и валидация изменений
+                CSBL -> CSDB++: [1.C.4] JDBC write: сохранение\n сampaigns / сontents / strategies
+                CSDB -> CSBL--: сохранено
+                CSDB ->> CSDBREP--: [1.C.4.1] streaming: репликация
+                CSBL ->> K: [1.C.5] Kafka Producer: события изменения кампаний и составляющих \n(campaign_changed / content_changed / strategy_changed)
+                note right of K: см. Сценарий 5. Обновление кешей\n см. Запрос отчета
+            CSBL --> CSAPI--: 200 OK
+        CSAPI --> CSISTIO: response: 200 OK
+            else GET
+            CSAPI -> CSDBREP++: [1.C.3a] JDBC read: Получение\n сampaigns / сontents / strategies
+            CSDBREP -> CSAPI--: сampaigns / сontents / strategies
+        CSAPI --> CSISTIO--: response: сampaigns / сontents / strategies
+            end
+    CSISTIO --> GW--: response
+GW --> Advertiser--: HTTPS: response
+
+== Пополнение бюджета ==
+
+Advertiser -> GW++: POST запрос пополнения
+    GW -> FSISTIO++: HTTPS/REST over mTLS (Istio)
+        note left of FSISTIO: см. Сценарий 4. Финансы
+    FSISTIO --> GW--: 202 Accepted
+GW --> Advertiser--: 202 Accepted
+
+== Просмотр финансов ==
+
+Advertiser -> GW++: GET budgets / state_budgets / transactions / accounts
+    GW -> FSISTIO++: HTTPS/REST over mTLS (Istio)
+        note left of FSISTIO: см. Сценарий 4. Финансы
+    FSISTIO --> GW--: response
+GW --> Advertiser--: HTTPS: response
+
+== Запрос отчета ==
+
+K -> AW++: [1.A(a)1] Kafka Consumer: сбор событий рекламных кампаний\n(campaign_changed / content_changed / strategy_changed /\n action_endUser / targeting_changed / state_budget_changed / transaction / contract_create / contract_deactivate / contract_completed)
+    AW -> CH++: [1.A(a)2] write: батчевая запись events, aggregates
+    CH --> AW--: saved events, aggregates
+    AW ->> K: [1.A(a)3] Kafka Producer: событие об изменении аналитики (analytics_changed)
+    note right of K: см. Сценарий 5. Обновление кешей
+AW -> K--: ACK
+
+Advertiser -> GW++: [1.1] GET: запрос отчета
+    GW -> AAISTIO++: [1.A.1] HTTPS/REST over mTLS (Istio)
+        AAISTIO -> AAAPI++: [1.A.2] sidecar forwarding: входящий HTTP-запрос
+            AAAPI ->> RQ: [1.A.3] Queue Producer: задача формирования отчёта (report)
+        AAAPI --> AAISTIO--: Accepted
+    AAISTIO --> GW--: 202 Accepted
+GW --> Advertiser--: 202 Accepted
+
+
+RQ -> RW++: [1.A.4] Queue Consumer: задача формирования отчёта (report)
+alt Timeout/Ошибка
+alt После N retries
+RW -> RQ: NACK + DLQ
+else
+RW -> RQ: NACK + requeue с backoff
+end
+else
+    RW -> CHREP++: [1.A.5] read: events
+    CHREP --> RW--: events
+    RW -> RW: [1.A.5.1] формирование отчета
+    RW -> CH++: [1.A.6] write: запись сформированного отчета (report)
+    CH --> RW--: saved
+    RW --> Advertiser: [1.A.7] уведомление о готовности отчета
+RW -> RQ--: ACK
+end
+
+== Просмотр аналитики ==
+
+CH ->> CHREP: [1.A(a).2.1]/[1.A.6.1] streaming: репликация\n (events, aggregates, reports)
+Advertiser -> GW++: [1.1] GET reports / aggregates
+    GW -> AAISTIO++: [1.A.1] HTTPS/REST over mTLS (Istio)
+        AAISTIO -> AAAPI++: [1.A.2] sidecar forwarding: входящий HTTP-запрос
+            AAAPI -> CHREP++: [1.A.3a] read
+            CHREP --> AAAPI--: reports / aggregates
+        AAAPI --> AAISTIO--: response: reports / aggregates
+    AAISTIO --> GW--: response
+GW --> Advertiser--: HTTPS: response
+
+@enduml
