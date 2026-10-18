@@ -1,0 +1,343 @@
+@startuml
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+
+LAYOUT_WITH_LEGEND()
+
+title C4 Container Diagram — AdScale (TO-BE)
+
+AddElementTag("events", $bgColor="#C8E6C9", $borderColor="#2E7D32", $fontColor="#1B5E20")
+AddElementTag("istio", $bgColor="#D1C4E9", $borderColor="#4527A0", $fontColor="#311B92")
+AddElementTag("monitoring", $bgColor="#FFF9C4", $borderColor="#F9A825", $fontColor="#6D4C41")
+
+AddRelTag("kafka_producer", $lineColor="purple", $textColor = "purple" )
+AddRelTag("kafka_consumer", $lineColor="orchid", $textColor = "orchid" )
+AddRelTag("queue_consumer", $lineColor="olive", $textColor = "olive" )
+AddRelTag("queue_producer", $lineColor="green", $textColor = "green" )
+AddRelTag("ad_request", $lineColor="red", $textColor = "red" )
+AddRelTag("ad_response", $lineColor="orange", $textColor = "orange" )
+AddRelTag("advertiser", $lineColor="brown", $textColor = "brown" )
+AddRelTag("payment", $lineColor="black", $textColor = "black" )
+
+' ====================== Акторы ======================
+Person(advertiser, "Рекламодатель", "Управляет кампаниями, бюджетами и ставками через личный кабинет")
+System_Ext(paymentGateway, "Платёжный шлюз", "Обработка пополнения рекламных бюджетов")
+System_Ext(dspPartner, "DSP-партнёр", "Отправляет bid requests, получает bid responses по OpenRTB, присылает результаты по применению рекламы")
+System_Ext(platform, "Площадка пользователя (сайт/приложение)", "Присылает результаты по применению рекламы")
+Person_Ext(endUser, "Пользователь сайта/приложения", "Просматривает рекламу, кликает по баннерам")
+
+Person(sre, "SRE / дежурный", "Реагирует на алерты, исследует инциденты")
+Person(dev, "Разработчик", "Разбирает трейсы и логи при отладке")
+
+
+System_Boundary(adScale, "AdScale") {
+
+    Container(gw, "API Gateway", "Kong / Nginx", "Routing, rate limiting, Auth, circuit breaker", $tags ="istio")
+    note right of gw
+    -> monitoring
+        prometheus: Scrape metrics (HTTPS over mTLS /metrics)
+        OTel Collector: OTLP spans (gRPC)
+    end note
+
+    Boundary(events, "Messaging & Eventing") {
+        Container(kafka, "Apache Kafka", "Kafka 3.x", "Асинхронные события, at-least-once", $tags ="events")
+        note left of kafka
+        -> monitoring
+          exporter: Метрики брокера + consumer lag (JMX / Kafka protocol)
+        end note
+        Container(rabbitmq, "RabbitMQ", "Task Queue", "Очередь задач для платежей, DLQ для retries", $tags ="events")
+        note bottom of rabbitmq
+        -> monitoring
+          exporter: Метрики очередей и DLQ (Management API)
+        end note
+    }
+
+    Boundary(adCabinet, "Advertiser Dashboard") {
+
+         System_Boundary(adCabinetMain, "Main Advertiser Dashboard") {
+            Container(istioCabinet, "Istio Sidecar", "Envoy / Istio Proxy", "Прокси service mesh для Advertiser Dashboard BFF", $tags ="istio")
+            Container(adCabinetBFF, "Advertiser Dashboard BFF", "Go / HTTPS / Kafka Producer", "BFF для Web APP")
+            Container(advertiserCache, "Redis Cluster (Primary/Replica)", "Redis 7 (Failover, Sentinel)", "Кэш данных кабинета рекламодателя")
+            note right of istioCabinet
+                 -> monitoring
+                     prometheus: Scrape metrics (HTTPS over mTLS /metrics)
+                    OTel Collector: OTLP spans (gRPC)
+                 end note
+            note top of advertiserCache
+            -> monitoring
+              exporter: Метрики Redis (INFO / Redis protocol)
+            end note
+         }
+
+         System_Boundary(campaignService, "Campaign Service") {
+            Container(istioCamp, "Istio Sidecar", "Envoy / Istio Proxy", "Прокси service mesh для Campaign Service", $tags ="istio")
+            Container(campaignAPI, "Campaign API", "Go / REST HTTPS", "Управление рекламными кампаниями, их контентом и стратегиями ставок")
+            Container(campaignBusinessLogic, "Campaign Business Logic", "Go / Kafka Producer", "Валидация и сохранение изменений + Events to Kafka")
+            ContainerDb(campaignDB, "Campaign DB (Primary/Replica)", "PostgreSQL", "campings, content, strategy")
+            note left of istioCamp
+            -> monitoring
+                prometheus: Scrape metrics (HTTPS over mTLS /metrics)
+                    OTel Collector: OTLP spans (gRPC)
+            end note
+            note right of campaignDB
+            -> monitoring
+              exporter: Метрики PostgreSQL (SQL / pg_stat)
+            end note
+
+         }
+
+         System_Boundary(financialService, "Financial Service") {
+            Container(istioFinancial, "Istio Sidecar", "Envoy / Istio Proxy", "Прокси service mesh для Financial Service", $tags ="istio")
+            Container(financialAPI, "Financial API", "Go / REST HTTPS", "Управление финансами")
+            Container(financialBusinessLogic, "Financial Business Logic", "Go / Kafka producer", "Изменения бюджета и статистики по нему, формирование счетов и платежей (ACID transactions, Idempotency)")
+            Container(contractWorker, "Contract Worker", "Go / Kafka consumer / Queue Producer", "Обработка списаний")
+            Container(creditWorker, "Credit Worker", "Go / RabbitMQ consumer / Queue Producer", "Обработка пополнений")
+            Container(transactionWorker, "Transaction Worker", "Go / RabbitMQ consumer", "Обработка операций")
+            ContainerDb(financialDB, "Financial DB (Primary/Replica)", "PostgreSQL / ACID", "budgets, statistic_budgets, reserve_budgets,  credits, debits, transactions, accounts")
+            note bottom of istioFinancial
+            -> monitoring
+               prometheus: Scrape metrics (HTTPS over mTLS /metrics)
+                    OTel Collector: OTLP spans (gRPC)
+            end note
+            note right of financialDB
+            -> monitoring
+              exporter: Метрики PostgreSQL (SQL / pg_stat)
+            end note
+
+        }
+
+        System_Boundary(analyticsService, "Analytics Service") {
+            Container(istioAnalytics, "Istio Sidecar", "Envoy / Istio Proxy", "Прокси service mesh для Analytics Service", $tags ="istio")
+            Container(analyticsAPI, "Analytics API", "Python / REST HTTPS / RabbitMQ Producer", "Аналитические SQL-запросы")
+            Container(analyticsWorker, "Analytics Worker Cluster", "Python / Kafka consumer / Kafka Producer", "Обработка бизнес-событий")
+            Container(reportsWorker, "Reports Worker Cluster", "Python / RabbitMQ consumer", "Формирование отчета")
+            ContainerDb(clickhouse, "ClickHouse Cluster (Primary/Replica)", "OLAP DB", "events, aggregates, reports")
+            note right of istioAnalytics
+            -> monitoring
+              prometheus: Scrape metrics (HTTPS over mTLS /metrics)
+                    OTel Collector: OTLP spans (gRPC)
+            end note
+            note right of clickhouse
+            -> monitoring
+              exporter: Метрики ClickHouse (HTTP / system tables)
+            end note
+
+
+        }
+    }
+
+    Boundary(ad, "Ad") {
+        Boundary(adRequests, "Ad Request (Hot path, синхронный)") {
+
+            System_Boundary(adService, "Bidding Service") {
+                Container(istioAd, "Istio Sidecar", "Envoy / Istio Proxy", "Прокси service mesh для Ad Request Service", $tags ="istio")
+                Container(updateAdCache, "Update Cache Worker", "Go / gRPC / Kafka consumer", "Обновляет кеш по событию")
+                Container(adAPI, "Ad API", "Go / HTTPS OpenRTB", "Принимает HTTP-запросы")
+                Container(adServer, "Ad Server", "C++", "Определяет пользователя, подбирает кандидатов в рекламу")
+                ContainerDb(adCache, "Redis Cluster (BC)", "Redis 7 (Failover, Sentinel)", "Кэш рекламных кампаний, их стратегий и контента, таргетинга и баннеров")
+                note left of istioAd
+                -> monitoring
+                    prometheus: Scrape metrics (HTTPS over mTLS /metrics)
+                    OTel Collector: OTLP spans (gRPC)
+                end note
+                 note top of adCache
+                 -> monitoring
+                  exporter: Метрики Redis (INFO / Redis protocol)
+                end note
+
+            }
+
+            System_Boundary(auctionService, "Auction Service") {
+                Container(istioAuction, "Istio Sidecar", "Envoy / Istio Proxy", "Прокси service mesh для Auction Service", $tags ="istio")
+                Container(auctionAPI, "Auction API", "Go / gRPC", "Управление аукционами")
+                Container(auctionEngine, "Auction Engine", "C++", "RTB auction, Взвешивание ставок, бизнес-правила, расчёт победителя аукциона")
+                ContainerDb(clickhouseAuction, "ClickHouse (Primary/Replica)", "OLAP DB ", "candidates_data, auction_result, ML_data, rules")
+                note left of istioAuction
+                -> monitoring
+                    prometheus: Scrape metrics (HTTPS over mTLS /metrics)
+                    OTel Collector: OTLP spans (gRPC)
+                end note
+                note right of clickhouseAuction
+                 -> monitoring
+                  exporter: Метрики ClickHouse (HTTP / system tables)
+                end note
+            }
+
+
+
+        }
+
+        Boundary(adResponse, "Ad Response") {
+
+        System_Boundary(deliveryService, "Delivery Service") {
+                Container(istioDelivery, "Istio Sidecar", "Envoy / Istio Proxy", "Прокси service mesh для Delivery Service", $tags ="istio")
+                Container(deliveryAPI, "Delivery API", "Node.js / HTTPS ", "Формирует HTML/JS-разметку баннера")
+                ContainerDb(deliveryDB, "Delivery DB (Primary/Replica)", "PostgreSQL", "responses, type_url, banners")
+                note left of istioDelivery
+                    -> monitoring
+                    prometheus: Scrape metrics (HTTPS over mTLS /metrics)
+                end note
+note left of deliveryDB
+            -> monitoring
+              exporter: Метрики PostgreSQL (SQL / pg_stat)
+            end note
+            }
+
+            System_Boundary(statsService, "Statistics Service") {
+
+                 Container(istioStat, "Istio Sidecar", "Envoy / Istio Proxy", "Прокси service mesh для Statistics Service", $tags ="istio")
+                 Container(statsAPI, "Statistics API", "Go / gRPC", "Предоставляет  таргетинг")
+                 Container(statsBusinessLogic, "Statistics Business Logic", "Go / Kafka Producer", "Сохранение асинхронных ответов партнера и действий пользователя, батчевые изменения таргетинга")
+                 ContainerDb(statsDB, "ClickHouse (Primary/Replica)", "OLAP DB", "action_EndUser, users_targeting, campaigns_targeting")
+                 Container(actionWorker, "Action Worker", "Go / Kafka consumer", "Обработка действий пользователя для статистики")
+
+                 note left of istioStat
+                 -> monitoring
+                     prometheus: Scrape metrics (HTTPS over mTLS /metrics)
+                    OTel Collector: OTLP spans (gRPC)
+                 end note
+                 note right of statsDB
+                 -> monitoring
+                  exporter: Метрики ClickHouse (HTTP / system tables)
+                end note
+
+             }
+
+
+         }
+
+    }
+
+    Boundary(monitoring, "Support") {
+         Container(observability, "Observability Stack", "Prometheus / OTel Collector/ Elasticsearch / Jaeger / Grafana / Alertmanager", "Метрики, трейсы, логи, алерты по SLO каждого сервиса", $tags ="monitoring")
+         Container(cicd, "CI/CD", "GitLab CI + ArgoCD", "Сборка образов, GitOps-деплой, canary и автоматический откат", $tags ="istio")
+    }
+
+}
+
+
+' Рекламодатель
+Rel_D(advertiser, gw, "[1.1] Совершает действие в кабинете рекламодателя", "HTTPS", $tags="advertiser")
+
+Rel_D(gw, istioCabinet, "[1.2]. Загрузка стартовой страницы", "HTTPS over mTLS (Istio service mesh)", $tags="advertiser")
+Rel_D(istioCabinet, adCabinetBFF, "[1.3] localhost / inbound proxy", "HTTPS")
+Rel_D(adCabinetBFF, advertiserCache, "[1.4] Получает кешированные данные рекламодателя", "Internal Call (Read Replica)")
+Rel_U(adCabinetBFF, istioCamp, "[1.4.1/5.2.1] Получает данные актуальных рекламных кампаний", "HTTPS/REST over mTLS (Istio service mesh)")
+Rel_D(adCabinetBFF, istioFinancial, "[1.4.2/5.2.2] Получает данные о балансе, истории операций", "HTTPS/REST over mTLS (Istio service mesh)")
+Rel_U(adCabinetBFF, istioAnalytics, "[1.4.3/5.2.4] Получает агрегированные данные о результатах рекламных кампаний", "HTTPS/REST over mTLS (Istio service mesh)")
+Rel_D(adCabinetBFF, advertiserCache, "[1.4.4/5.2.4] Обновляет кешированные данные рекламодателя", "Internal Call (Write)")
+Rel_D(adCabinetBFF, kafka, "[5.2] Kafka Consumer", "campaign_changed, analytics_changed, state_budget_changed", $tags="kafka_consumer")
+
+Rel_D(gw, istioCamp, "[1.C.1] Управляет кампаниями, их контентом и стратегиями ставок", "HTTPS/REST over mTLS (Istio service mesh)", $tags="advertiser")
+Rel_R(istioCamp, campaignAPI, "[1.C.2] localhost / inbound proxy", "sidecar forwarding")
+Rel_D(campaignAPI, campaignBusinessLogic, "[1.C.3] Обработка/валидация изменений кампаний, стратегий ставок, контента", "Internal Call")
+Rel_R(campaignBusinessLogic, campaignDB, "[1.C.4] Сохранение кампаний, стратегий ставок, контента", "JDBC (write)")
+Rel(campaignBusinessLogic, kafka, "[1.C.5] Kafka Producer", "campaign_changed, content_changed, strategy_changed", $tags="kafka_producer")
+Rel_R(campaignAPI, campaignDB, "[1.C.3(a)] Получение кампаний, стратегий ставок, контента", "JDBC (read replica)")
+'
+Rel_D(gw, istioAnalytics, "[1.A.1] Запросы аналитики", "HTTPS/REST over mTLS (Istio service mesh)", $tags="advertiser")
+Rel_L(istioAnalytics, analyticsAPI, "[1.A.2] localhost / inbound proxy", "sidecar forwarding")
+Rel(analyticsAPI, rabbitmq, "[1.A.3] Queue Producer", "report", $tags="queue_producer")
+Rel_D(reportsWorker, rabbitmq, "[1.A.4] Queue Consumer (ACK/NACK, DLQ)", "report", $tags="queue_consumer")
+Rel_U(reportsWorker, clickhouse, "[1.A.5] Чтение событий", "read replica")
+Rel_U(reportsWorker, clickhouse, "[1.A.6] Формирование отчета и его запись", "write")
+Rel_U(reportsWorker, advertiser, "[1.A.7] Уведомление", "HTTPS/Websocket", $tags="advertiser")
+Rel(analyticsWorker, kafka, "[1.A(a).1] Kafka Consumer", "campaign_changed, content_changed, strategy_changed, action_endUser, targeting_changed, state_budget_changed, transaction, contract_created ,contract_deactivated, contract_completed", $tags="kafka_consumer")
+Rel_R(analyticsWorker, clickhouse, "[1.A(a).2] Сохранение событий, обновление агрегатов", "write")
+Rel(analyticsWorker, kafka, "[1.A(a).3] Kafka Producer", "analytics_changed", $tags="kafka_producer")
+Rel_D(analyticsAPI, clickhouse, "[1.A.3a] Агрегаты, отчеты", "read replica")
+
+Rel_D(gw, istioFinancial, "[4.F.1] Управляет финансами", "HTTPS/REST over mTLS (Istio service mesh)", $tags="advertiser")
+Rel_L(istioFinancial, financialAPI, "[4.F.1.1]/[4.F.4.1] localhost / inbound proxy", "sidecar forwarding")
+Rel_D(financialAPI, rabbitmq, "[4.F.1.2]/[4.F.4.2]. Queue Producer", "credit/callback", $tags="queue_producer")
+Rel_U(creditWorker, rabbitmq, "[4.F.2]/[4.F.5] Queue Consumer (ACK/NACK, DLQ)", "credit/callback", $tags="queue_consumer")
+Rel_U(creditWorker, financialBusinessLogic, "[4.F.2.1]/[4.F.5.1] Создание/Изменение пополнения", "Internal Call")
+Rel_R(financialBusinessLogic, financialDB, "[4.F.2.2]/[4.F.5.2] Сохранение изменений пополнения", "JDBC (write)")
+Rel_R(creditWorker, paymentGateway, "[4.F.3]. Запрос к платежной системе", "HTTPS/REST", $tags="payment")
+Rel(paymentGateway, gw, "[4.F.3.1]. Ответ платежной системы (сallback)", "HTTPS/REST", $tags="payment")
+Rel_D(gw, istioFinancial, "[4.F.4]. Передача ответа платежной системы", "HTTPS/REST over mTLS (Istio service mesh)", $tags="payment")
+Rel_U(creditWorker, rabbitmq, "[4.F.5.3]. Queue Producer", "transaction (credit)", $tags="queue_producer")
+Rel_L(transactionWorker, rabbitmq, "[4.F.6] Queue Consumer (ACK/NACK, DLQ)", "transaction", $tags="queue_consumer")
+Rel_R(transactionWorker, financialBusinessLogic, "[4.F.6.1] Идемпотентные транзакции", "Internal Call")
+Rel_R(financialBusinessLogic, financialDB, "[4.F.6.2] Сохранение бюджета, статистики бюджета и транзакции", "JDBC (write)")
+Rel(financialBusinessLogic, kafka, "[4.F.6.3] Kafka Producer", "transaction, state_budget_changed", $tags="kafka_producer")
+Rel_D(financialAPI,financialDB,"[4.F.2(a)]. Баланс, история пополнений и списаний","JDBC (read replica)")
+Rel_U(contractWorker, kafka, "[3.F.1] Kafka Consumer", "contract_created, contract_activated, contract_completed, contract_deactivate", $tags="kafka_consumer")
+Rel_D(contractWorker, financialBusinessLogic, "[3.F.2]. Изменение контракта", "Internal Call")
+Rel_R(financialBusinessLogic, financialDB, "[3.F.3]. Сохранение контакта", "JDBC (write)")
+Rel(financialBusinessLogic, kafka, "[3.F.4] Kafka Producer (если contract_activated)", "contract_action_task", $tags="kafka_producer")
+Rel_D(contractWorker, rabbitmq, "[3.F.4(a)] Queue Producer (если contract_completed)", "transaction (debit)", $tags="queue_producer")
+
+'Партнер
+Rel_D(dspPartner, gw, "[2.1] Bid requests / responses", "HTTPS/OpenRTB", $tags="ad_request")
+
+Rel_D(gw, istioAd, "[2.R.1] Запрашивает рекламу для пользователя", "HTTPS/REST over mTLS (Istio service mesh)", $tags="ad_request")
+Rel_R(istioAd, adAPI, "[2.R.1.1]. localhost / inbound proxy", "sidecar forwarding")
+Rel_D(adAPI, adServer, "[2.R.2] Поиск кандидатов и расчет ставок", "Internal Call")
+Rel_L(adServer, adCache, "[2.R.2.1] Собирает кешированные данные кампаний и таргетинга пользователя для поиска кандидатов", "Internal (read replica)")
+Rel_L(adServer, adCache, "[2.R.2.2] Собирает кешированные баннеры кандидатов", "Internal Call (read replica)")
+Rel_L(adServer, adCache, "[2.R.2.3] Собирает кешированные данные стратегий кампаний и таргетинга кампании для расчета ставок", "Internal Call (read replica)")
+Rel_D(adAPI, kafka, "[2.R.2.3(a)] Kafka Producer", "bid_cache_init", $tags="kafka_producer")
+Rel_D(adServer, istioAuction,  "[2.R.3] Запрос выбора победителя из кандидатов, если партнеру требуется внутренний аукцион", "gRPC over mTLS (Istio service mesh)")
+Rel_L(adServer, adCache, "[2.R.4] Обновляет данные кампаний, таргетинга и состояния бюджетов", "Internal Call (write)")
+Rel_D(adAPI, kafka, "[2.R.5] Kafka Producer", "contract_create", $tags="kafka_producer")
+Rel_L(updateAdCache, kafka, "[5.1] Kafka Consumer", "bid_cache_init / campaign_changed / content_changed / strategy_changed / state_budget_changed / targeting_changed ", $tags="kafka_consumer")
+Rel_D(updateAdCache, istioCamp, "[5.1.1] Получает актуальные данные кампаний, стратегий и контента рекламы (campaign_changed, content_changed, strategy_changed)", "HTTPS/REST over mTLS (Istio service mesh)")
+Rel_U(updateAdCache, istioDelivery, "[5.1.1.1] Получить готовый баннер, если изменился контент рекламы (adContent_changed)", "HTTPS over mTLS (Istio service mesh)")
+Rel_D(updateAdCache, istioStat, "[5.1.2] Получить актуальные данные таргетинга пользователя и таргетинга кампаний (users_targeting, campaigns_targeting)", "gRPC over mTLS (Istio service mesh)")
+Rel_D(updateAdCache, istioFinancial, "[5.1.3]. Получить актуальные данные бюджета и его статистики", "HTTPS/REST over mTLS (Istio service mesh)")
+Rel_D(updateAdCache, adCache, "[5.1.4] Обновляет данные кампаний, таргетинга и состояния бюджетов", "Internal Call (write)")
+
+Rel_D(istioAuction, auctionAPI, "[2.AU.1] localhost / inbound proxy", "sidecar forwarding")
+Rel_D(auctionAPI, clickhouseAuction, "[2.AU.2] Получить правила и историю необходимые для аукциона", "read replica")
+Rel_R(auctionAPI, auctionEngine, "[2.AU.3] Запуск аукциона ", "Internal Call")
+Rel_D(auctionEngine, clickhouseAuction, "[2.AU.4] Запись кандидатов и результата ", write")
+
+'Пользователь
+Rel_D(dspPartner, gw, "[3.1] Выигрыш, проигрыш, показ", "HTTPS", $tags="ad_response")
+Rel_R(platform, dspPartner, "[3.0] Выигрыш, проигрыш, показ", "HTTPS", $tags="ad_response")
+Rel_D(endUser, gw, "[3.1(a)] Просмотр рекламы и клики", "HTTPS", $tags="ad_response")
+Rel_R(gw, istioDelivery, "[3.D.1] Совершает действие с рекламой", "HTTPS over mTLS (Istio service mesh)", $tags="ad_response")
+Rel_D(istioDelivery, deliveryAPI, "[3.D.1.1] localhost / inbound proxy", "sidecar forwarding")
+Rel_D(deliveryAPI, deliveryDB, "[3.D.2] Поиск дублей для дедубликации, получение типа действия, сформированного баннера", "JDBC (read replica)")
+Rel_D(deliveryAPI, deliveryDB,"[3.D.3] Сохранение новых запросов","JDBC (write)")
+Rel_D(deliveryAPI, kafka, "[3.D.4] Kafka Producer", "action_endUser, contract_activate", $tags="kafka_producer")
+
+Rel_L(actionWorker, kafka, "[3.S.1] Kafka Consumer", "action_endUser, contract_task", $tags="kafka_consumer")
+Rel_U(actionWorker, statsBusinessLogic, "[3.S.2] Обработка действий пользователя", "Internal Call")
+Rel(statsBusinessLogic, statsDB, "[3.S.3] Батчевое сохранение действий пользователя и таргетинга на их основе", "write")
+Rel_U(statsBusinessLogic, kafka, "S.A.4 Kafka Producer", "targeting_changed, contract_completed", $tags="kafka_producer")
+Rel_D(istioStat, statsAPI, "[5.1.2] localhost / inbound proxy", "sidecar forwarding")
+Rel_L(statsAPI, statsBusinessLogic, "[5.S.1] Запрос таргетинга", "Internal Call")
+Rel_D(statsAPI, statsDB, "[5.S.2] Получение таргетинга", "read replica")
+
+'Поддержка
+Rel_U(observability, sre, "Дашборды и алерты", "HTTPS")
+Rel_U(observability, dev, "Трейсы и логи", "HTTPS")
+Rel_U(cicd, sre, "Дашборды и алерты", "HTTPS")
+Rel_U(cicd, dev, "Трейсы и логи", "HTTPS")
+
+''Выравнивание
+Lay_U(rabbitmq, kafka)
+
+Lay_D(reportsWorker, istioFinancial)
+'Lay_D(istioFinancial,financialBusinessLogic)
+
+Lay_D(reportsWorker, kafka)
+Lay_D(adServer, kafka)
+
+Lay_U(istioDelivery, istioAd)
+Lay_D(deliveryAPI, kafka)
+Lay_D(deliveryDB, istioStat)
+
+Lay_D(adAPI, updateAdCache)
+Lay_D(updateAdCache, adServer)
+
+Lay_U(istioCamp, observability)
+Lay_D(gw, istioCabinet)
+Lay_R(reportsWorker, advertiser)
+Lay_L(reportsWorker, kafka)
+
+
+
+@enduml
